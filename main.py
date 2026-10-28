@@ -1,49 +1,136 @@
 
 import cv2
 import numpy as np
+from ultralytics import YOLO, YOLOWorld
 
-camera = cv2.VideoCapture(0)
+# False: COCO model (80 fixed classes, no "pencil")
+# True: YOLO-World (open vocabulary, searches the names in TARGET_CLASSES)
+USE_YOLO_WORLD = True
 
-if not camera.isOpened():
-    raise RuntimeError("Could not open the webcam.")
+# Objects YOLO-World should look for (English works best)
+TARGET_CLASSES = ["pencil", "pen", "cup", "bottle", "scissors", "person"]
 
-last_cell = None
+# Minimum confidence to accept a detection.
+# YOLO-World scores are usually lower than COCO ones.
+CONFIDENCE_THRESHOLD = 0.15 if USE_YOLO_WORLD else 0.5
 
-while True:
-    success, frame = camera.read()
+# HSV ranges for each color. Red needs two ranges because
+# its hue sits at both ends of the 0-179 scale.
+COLOR_RANGES = {
+    "red": [
+        ([0, 100, 80], [10, 255, 255]),
+        ([170, 100, 80], [179, 255, 255]),
+    ],
+    "orange": [([11, 100, 80], [22, 255, 255])],
+    "yellow": [([23, 100, 80], [34, 255, 255])],
+    "green": [([35, 100, 80], [85, 255, 255])],
+    "blue": [([86, 100, 80], [130, 255, 255])],
+    "purple": [([131, 100, 80], [169, 255, 255])],
+}
 
-    if not success:
-        print("Could not capture a frame.")
-        break
+# Minimum share of the box a color must cover to be accepted
+MIN_COLOR_RATIO = 0.15
 
+def load_model():
+    if USE_YOLO_WORLD:
+        model = YOLOWorld("yolov8s-worldv2.pt")
+        model.set_classes(TARGET_CLASSES)
+    else:
+        model = YOLO("yolo11n.pt")
+
+    return model
+
+def get_grid_cell(center_x, center_y, width, height):
+    # Determine the horizontal position
+    if center_x < width // 3:
+        horizontal = "LEFT"
+    elif center_x < (2 * width) // 3:
+        horizontal = "CENTER"
+    else:
+        horizontal = "RIGHT"
+
+    # Determine the vertical position
+    if center_y < height // 3:
+        vertical = "TOP"
+    elif center_y < (2 * height) // 3:
+        vertical = "MIDDLE"
+    else:
+        vertical = "BOTTOM"
+
+    return f"{vertical}-{horizontal}"
+
+def get_dominant_color(hsv_region):
+    total_pixels = hsv_region.shape[0] * hsv_region.shape[1]
+
+    if total_pixels == 0:
+        return "unknown"
+
+    best_color = "unknown"
+    best_ratio = 0.0
+
+    for color, ranges in COLOR_RANGES.items():
+        # Combine all the ranges of this color into one mask
+        mask = np.zeros(hsv_region.shape[:2], dtype=np.uint8)
+
+        for lower, upper in ranges:
+            range_mask = cv2.inRange(
+                hsv_region, np.array(lower), np.array(upper)
+            )
+            mask = cv2.bitwise_or(mask, range_mask)
+
+        ratio = cv2.countNonZero(mask) / total_pixels
+
+        if ratio > best_ratio:
+            best_color = color
+            best_ratio = ratio
+
+    # Ignore colors that only cover a few pixels of the box
+    if best_ratio < MIN_COLOR_RATIO:
+        return "unknown"
+
+    return best_color
+
+def detect_objects(model, frame):
+    height, width = frame.shape[:2]
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+    # Run the model on the frame (one image -> one result)
+    result = model(frame, conf=CONFIDENCE_THRESHOLD, verbose=False)[0]
+
+    detections = []
+
+    for box in result.boxes:
+        # Box corners in pixels
+        left, top, right, bottom = box.xyxy[0].int().tolist()
+
+        class_id = int(box.cls[0])
+        name = result.names[class_id]
+        confidence = float(box.conf[0])
+
+        center_x = (left + right) // 2
+        center_y = (top + bottom) // 2
+
+        # Check the color only inside the detected box
+        color = get_dominant_color(hsv[top:bottom, left:right])
+
+        detections.append({
+            "name": name,
+            "color": color,
+            "confidence": confidence,
+            "box": (left, top, right, bottom),
+            "center": (center_x, center_y),
+            "cell": get_grid_cell(center_x, center_y, width, height),
+        })
+
+    return detections
+
+def draw_grid(frame):
     height, width = frame.shape[:2]
 
-    # Calculate the grid boundaries
     x1 = width // 3
     x2 = (2 * width) // 3
     y1 = height // 3
     y2 = (2 * height) // 3
-
-    # Convert the image from BGR to HSV
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-
-    # Define the red color ranges
-    lower_red_1 = np.array([0, 100, 80])
-    upper_red_1 = np.array([10, 255, 255])
-
-    lower_red_2 = np.array([170, 100, 80])
-    upper_red_2 = np.array([179, 255, 255])
-
-    mask_1 = cv2.inRange(hsv, lower_red_1, upper_red_1)
-    mask_2 = cv2.inRange(hsv, lower_red_2, upper_red_2)
-    mask = cv2.bitwise_or(mask_1, mask_2)
-
-    # Find red objects
-    contours, _ = cv2.findContours(
-        mask,
-        cv2.RETR_EXTERNAL,
-        cv2.CHAIN_APPROX_SIMPLE
-    )
 
     # Draw the 3x3 grid
     cv2.line(frame, (x1, 0), (x1, height), (255, 255, 0), 2)
@@ -65,96 +152,82 @@ while True:
         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2
     )
 
-    object_found = False
+def draw_detection(frame, detection):
+    left, top, right, bottom = detection["box"]
 
-    if contours:
-        largest = max(contours, key=cv2.contourArea)
-        area = cv2.contourArea(largest)
+    cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
+    cv2.circle(frame, detection["center"], 5, (255, 0, 0), -1)
 
-        # Ignore small red regions
-        if area > 500:
-            object_found = True
+    label = (
+        f"{detection['color']} {detection['name']} "
+        f"{detection['confidence']:.2f}"
+    )
 
-            x, y, w, h = cv2.boundingRect(largest)
+    cv2.putText(
+        frame,
+        label,
+        (left, max(top - 10, 45)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (0, 255, 0),
+        2
+    )
 
-            # Calculate the object's center
-            center_x = x + w // 2
-            center_y = y + h // 2
+model = load_model()
 
-            # Determine the horizontal position
-            if center_x < x1:
-                horizontal = "LEFT"
-            elif center_x < x2:
-                horizontal = "CENTER"
-            else:
-                horizontal = "RIGHT"
+camera = cv2.VideoCapture(0)
 
-            # Determine the vertical position
-            if center_y < y1:
-                vertical = "TOP"
-            elif center_y < y2:
-                vertical = "MIDDLE"
-            else:
-                vertical = "BOTTOM"
+if not camera.isOpened():
+    raise RuntimeError("Could not open the webcam.")
 
-            # Combine both positions
-            cell = f"{vertical}-{horizontal}"
+last_summary = None
 
-            # Draw the detected object
-            cv2.rectangle(
-                frame,
-                (x, y),
-                (x + w, y + h),
-                (0, 255, 0),
-                2
-            )
+while True:
+    success, frame = camera.read()
 
-            cv2.circle(
-                frame,
-                (center_x, center_y),
-                5,
-                (255, 0, 0),
-                -1
-            )
+    if not success:
+        print("Could not capture a frame.")
+        break
 
-            # Display the position and pixel coordinates
-            label = f"{cell} | X:{center_x} Y:{center_y}"
+    height = frame.shape[0]
 
-            cv2.putText(
-                frame,
-                label,
-                (10, height - 20),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
-                (0, 255, 0),
-                2
-            )
+    detections = detect_objects(model, frame)
 
-            # Print only when the object changes cells
-            if cell != last_cell:
-                print(
-                    f"Object: {cell} | "
-                    f"X={center_x}, Y={center_y}"
-                )
-                last_cell = cell
+    draw_grid(frame)
 
-    # Reset the previous position when the object disappears
-    if not object_found:
-        last_cell = None
+    for detection in detections:
+        draw_detection(frame, detection)
 
-        cv2.putText(
-            frame,
-            "No red object detected",
-            (10, height - 20),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
-            (0, 0, 255),
-            2
-        )
+    if detections:
+        status = f"{len(detections)} object(s) detected"
+        status_color = (0, 255, 0)
+    else:
+        status = "No objects detected"
+        status_color = (0, 0, 255)
 
-    # Display the camera feed and the binary mask
-    cv2.imshow("Robot Vision - 3x3 Grid", frame)
-    cv2.imshow("Red Object Mask", mask)
+    cv2.putText(
+        frame,
+        status,
+        (10, height - 20),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        status_color,
+        2
+    )
+
+    # Print only when the list of objects or their cells changes
+    summary = sorted(
+        f"{d['color']} {d['name']} in {d['cell']}" for d in detections
+    )
+
+    if summary != last_summary:
+        if summary:
+            print("Objects: " + " | ".join(summary))
+        else:
+            print("No objects detected")
+        last_summary = summary
+
+    cv2.imshow("Robot Vision - Object Detection", frame)
 
     # Press Q to quit
     if cv2.waitKey(1) & 0xFF == ord("q"):

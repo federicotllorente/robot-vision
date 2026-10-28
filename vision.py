@@ -2,6 +2,8 @@ import cv2
 import numpy as np
 from ultralytics import YOLO, YOLOWorld
 
+import ui_theme as ui
+
 # False: COCO model (80 fixed classes, no "pencil")
 # True: YOLO-World (open vocabulary, searches the names in TARGET_CLASSES)
 USE_YOLO_WORLD = True
@@ -148,51 +150,59 @@ def detect_objects(model, frame):
 
     return detections
 
-def draw_grid(frame):
-    height, width = frame.shape[:2]
+def draw_grid(canvas, top_margin=0):
+    """3x3 grid in the HUD style. top_margin leaves room for the header bar."""
+    height, width = canvas.shape[:2]
 
     x1 = width // 3
     x2 = (2 * width) // 3
     y1 = height // 3
     y2 = (2 * height) // 3
 
-    # Draw the 3x3 grid
-    cv2.line(frame, (x1, 0), (x1, height), (255, 255, 0), 2)
-    cv2.line(frame, (x2, 0), (x2, height), (255, 255, 0), 2)
-    cv2.line(frame, (0, y1), (width, y1), (255, 255, 0), 2)
-    cv2.line(frame, (0, y2), (width, y2), (255, 255, 0), 2)
+    # Thin, discreet lines: the grid is a reference, not the main content
+    for start, end in (
+        ((x1, top_margin), (x1, height)),
+        ((x2, top_margin), (x2, height)),
+        ((0, y1), (width, y1)),
+        ((0, y2), (width, y2)),
+    ):
+        cv2.line(canvas, start, end, ui.MUTED, ui.u(0.5), cv2.LINE_AA)
 
-    # Label the grid columns
-    cv2.putText(
-        frame, "LEFT", (10, 25),
-        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2
-    )
-    cv2.putText(
-        frame, "CENTER", (x1 + 10, 25),
-        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2
-    )
-    cv2.putText(
-        frame, "RIGHT", (x2 + 10, 25),
-        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2
-    )
+    # Column labels along the top, row labels on the right edge, both at the
+    # start of their row/column (the bottom-left corner is for the status line)
+    label_y = top_margin + ui.u(16)
+    for x, name in ((0, "LEFT"), (x1, "CENTER"), (x2, "RIGHT")):
+        ui.text(canvas, name, (x + ui.u(8), label_y), size=8, color=ui.MUTED, font="title", weight=600)
+    for y, name in ((top_margin, "TOP"), (y1, "MIDDLE"), (y2, "BOTTOM")):
+        label_w = ui.text_width(canvas, name, 8, "title", 600)
+        ui.text(canvas, name, (width - label_w - ui.u(8), y + ui.u(16)), size=8, color=ui.MUTED, font="title", weight=600)
 
-def draw_detection(frame, detection):
-    left, top, right, bottom = detection["box"]
+def draw_detection(canvas, detection, scale=1.0, top_margin=0):
+    """Draw one detection. scale converts camera pixels to canvas pixels."""
+    left, top, right, bottom = (int(v * scale) for v in detection["box"])
+    center = (int(detection["center"][0] * scale), int(detection["center"][1] * scale))
 
-    cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
-    cv2.circle(frame, detection["center"], 5, (255, 0, 0), -1)
+    cv2.rectangle(canvas, (left, top), (right, bottom), ui.CYAN, ui.u(0.5), cv2.LINE_AA)
+    ui.corner_brackets(canvas, (left, top), (right, bottom), ui.CYAN, length=12, thickness=3)
 
-    label = (
-        f"{detection['color']} {detection['name']} "
-        f"{detection['confidence']:.2f}"
-    )
+    # Target marker at the center: ring + dot
+    cv2.circle(canvas, center, ui.u(6), ui.CYAN, ui.u(1), cv2.LINE_AA)
+    cv2.circle(canvas, center, ui.u(1.5), ui.CYAN, -1, cv2.LINE_AA)
 
-    cv2.putText(
-        frame,
-        label,
-        (left, max(top - 10, 45)),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        (0, 255, 0),
-        2
-    )
+    # Label tag on top of the box: "RED PENCIL  82%"
+    color = detection["color"].upper() if detection["color"] != "unknown" else ""
+    label = f"{color} {detection['name'].upper()}".strip()
+    percent = f"{detection['confidence'] * 100:.0f}%"
+    label_w = ui.text_width(canvas, label, 9, "title", 700)
+    percent_w = ui.text_width(canvas, percent, 11)
+
+    # Tag above the box; if there is no room (box touching the top), inside it
+    tag_height = ui.u(20)
+    if top - tag_height >= top_margin:
+        tag_bottom = top
+    else:
+        tag_bottom = max(top, top_margin) + tag_height
+    tag_top = tag_bottom - tag_height
+    ui.panel(canvas, (left, tag_top), (left + label_w + percent_w + ui.u(24), tag_bottom), alpha=0.75)
+    ui.text(canvas, label, (left + ui.u(7), tag_bottom - ui.u(6)), size=9, color=ui.CYAN, font="title", weight=700)
+    ui.text(canvas, percent, (left + label_w + ui.u(15), tag_bottom - ui.u(5)), size=11, color=ui.TEXT)
